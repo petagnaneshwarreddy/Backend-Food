@@ -30,15 +30,13 @@ if (missingVars.length > 0) {
 =========================== */
 
 const allowedOrigins = [
-  "http://localhost:3000",
-  "http://localhost:5173",
   process.env.FRONTEND_URL,
-].filter(Boolean); // removes undefined if FRONTEND_URL is not set
+].filter(Boolean); // only production frontend URL from env
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (Postman, mobile apps, curl)
-    if (!origin) return callback(null, true);
+    // Block requests with no origin (direct server access)
+    if (!origin) return callback(new Error("CORS blocked: No origin"));
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
