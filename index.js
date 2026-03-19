@@ -956,6 +956,131 @@ app.get("/api/reservations/my", verifyToken, async (req, res) => {
 });
 
 /* ═══════════════════════════════
+   NOTIFICATION MODEL
+   Created when a collector requests a code resend.
+   The notification goes to the DONOR of that food item.
+   The donor sees it in their notification bell in the navbar.
+═══════════════════════════════ */
+const NotificationSchema = new mongoose.Schema({
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true }, // donor user
+  title:     { type: String, required: true },
+  message:   { type: String, required: true },
+  code:      { type: String, default: null },   // pickup code to show in bell
+  read:      { type: Boolean, default: false },
+  type:      { type: String, default: "code_resend" },
+}, { timestamps: true });
+
+const Notification = mongoose.model("Notification", NotificationSchema);
+
+/* ═══════════════════════════════
+   NOTIFICATION ROUTES
+═══════════════════════════════ */
+
+// GET /api/notifications — get current donor's notifications (newest first)
+app.get("/api/notifications", verifyToken, async (req, res) => {
+  try {
+    const notifs = await Notification.find({ recipient: req.userId })
+      .sort({ createdAt: -1 })
+      .limit(50);
+    res.json(notifs);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch notifications." });
+  }
+});
+
+// PATCH /api/notifications/read-all — mark all as read for current user
+app.patch("/api/notifications/read-all", verifyToken, async (req, res) => {
+  try {
+    await Notification.updateMany({ recipient: req.userId, read: false }, { $set: { read: true } });
+    res.json({ message: "All notifications marked as read." });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to mark notifications as read." });
+  }
+});
+
+// PATCH /api/notifications/:id/read — mark single notification as read
+app.patch("/api/notifications/:id/read", verifyToken, async (req, res) => {
+  try {
+    await Notification.findOneAndUpdate(
+      { _id: req.params.id, recipient: req.userId },
+      { $set: { read: true } }
+    );
+    res.json({ message: "Notification marked as read." });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to mark notification as read." });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────
+   POST /api/reservations/resend-code
+   Called by a COLLECTOR who forgot their pickup code.
+
+   Body: { reserverName: "Ravi Kumar" }
+
+   Flow:
+   1. Find active (not collected, not expired) reservation by name
+   2. Find the food item → get the donor (food.user)
+   3. Create a Notification for the donor showing the code
+   4. Donor sees it in their bell → tells collector verbally
+
+   Returns: { message, donorName }
+─────────────────────────────────────────────────────────────── */
+const handleResendCode = async (req, res) => {
+  try {
+    const { reserverName } = req.body;
+    if (!reserverName || reserverName.trim().length < 2)
+      return res.status(400).json({ error: "Please provide your full name as used when reserving." });
+
+    const name = reserverName.trim();
+
+    // Find the most recent active reservation for this person
+    const reservation = await Reservation.findOne({
+      reserverName: { $regex: new RegExp(`^${name}$`, "i") }, // case-insensitive exact match
+      collected:    false,
+      codeExpiresAt: { $gt: new Date() }, // not expired
+    })
+      .populate({
+        path: "foodItem",
+        populate: { path: "user", select: "username _id" },
+      })
+      .sort({ createdAt: -1 });
+
+    if (!reservation)
+      return res.status(404).json({
+        error: `No active reservation found for "${name}". Please check the spelling of your name, or contact the donor directly.`,
+      });
+
+    const food  = reservation.foodItem;
+    const donor = food?.user;
+
+    if (!donor)
+      return res.status(404).json({ error: "Could not find the donor for this reservation." });
+
+    // Create a notification for the donor
+    await Notification.create({
+      recipient: donor._id,
+      title:     `📦 Code Resend Request`,
+      message:   `${reservation.reserverName} forgot their pickup code for "${food?.foodItem || "your item"}". Their code is shown below — please tell them verbally.`,
+      code:      reservation.code,
+      type:      "code_resend",
+      read:      false,
+    });
+
+    console.log(`✅ Code resend: notification sent to donor ${donor.username} for collector ${name}`);
+
+    res.json({
+      message: `✓ Done! ${donor.username || "The donor"} has been notified. Ask them to check their notification bell and read your code to you.`,
+      donorName: donor.username || "the donor",
+    });
+  } catch (err) {
+    console.error("resend-code error:", err);
+    res.status(500).json({ error: "Server error. Please try again." });
+  }
+};
+app.post("/reservations/resend-code",     verifyToken, handleResendCode);
+app.post("/api/reservations/resend-code", verifyToken, handleResendCode);
+
+/* ═══════════════════════════════
    GLOBAL ERROR HANDLER
 ═══════════════════════════════ */
 app.use((err, req, res, next) => {
