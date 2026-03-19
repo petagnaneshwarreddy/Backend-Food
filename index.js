@@ -655,6 +655,216 @@ app.patch("/inventory/approve/:id",     verifyToken, handleApproveInventory);
 app.patch("/api/inventory/approve/:id", verifyToken, handleApproveInventory);
 
 /* ═══════════════════════════════
+   RESERVATION MODEL
+   Each document = one person reserving one food item.
+   - reserverName, reserverPhone, reserverEmail  : contact info
+   - foodItem (WasteData _id)                    : which item
+   - quantity                                    : always 1
+   - code                                        : 6-char pickup code (expires 24h)
+   - codeExpiresAt                               : 24h from creation
+   - collected                                   : donor marks true on pickup
+═══════════════════════════════ */
+const ReservationSchema = new mongoose.Schema({
+  foodItem:      { type: mongoose.Schema.Types.ObjectId, ref: "WasteData", required: true },
+  reserverName:  { type: String, required: true },
+  reserverPhone: { type: String, required: true },
+  reserverEmail: { type: String, required: true },
+  quantity:      { type: Number, default: 1, min: 1, max: 1 },
+  code:          { type: String, required: true, unique: true },
+  codeExpiresAt: { type: Date, required: true },
+  collected:     { type: Boolean, default: false },
+}, { timestamps: true });
+
+const Reservation = mongoose.model("Reservation", ReservationSchema);
+
+/* ── generate 6-char alphanumeric pickup code ── */
+const generateCode = () => {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+};
+
+/* ═══════════════════════════════
+   RESERVATION ROUTES
+═══════════════════════════════ */
+
+// POST /api/reservations — make a reservation
+// Rules:
+//  • quantity locked to 1
+//  • same phone/email cannot reserve same food item twice
+//  • if total reservations >= foodQuantity → auto sold out
+const handleCreateReservation = async (req, res) => {
+  try {
+    const { foodItemId, reserverName, reserverPhone, reserverEmail } = req.body;
+
+    if (!foodItemId || !reserverName || !reserverPhone || !reserverEmail)
+      return res.status(400).json({ error: "Name, phone, email and food item are required." });
+
+    // Validate email format
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reserverEmail))
+      return res.status(400).json({ error: "Invalid email address." });
+
+    // Validate phone (min 7 digits)
+    if (!/^\+?[\d\s\-]{7,15}$/.test(reserverPhone))
+      return res.status(400).json({ error: "Invalid phone number." });
+
+    // Find the food item
+    const food = await WasteData.findById(foodItemId);
+    if (!food)
+      return res.status(404).json({ error: "Food item not found." });
+    if (food.approved)
+      return res.status(400).json({ error: "This item is already sold out." });
+
+    // Check if this person already reserved this item (by phone OR email)
+    const alreadyReserved = await Reservation.findOne({
+      foodItem: foodItemId,
+      $or: [
+        { reserverPhone: reserverPhone.trim() },
+        { reserverEmail: reserverEmail.trim().toLowerCase() },
+      ],
+    });
+    if (alreadyReserved)
+      return res.status(409).json({ error: "You have already reserved this item. You can reserve a different food item." });
+
+    // Count existing reservations for this item
+    const existingCount = await Reservation.countDocuments({ foodItem: foodItemId });
+    const totalQty      = Number(food.foodQuantity) || 1;
+
+    if (existingCount >= totalQty)
+      return res.status(400).json({ error: "Sorry, this item is fully reserved and no longer available." });
+
+    // Generate unique pickup code
+    let code, codeExists;
+    do {
+      code      = generateCode();
+      codeExists = await Reservation.findOne({ code });
+    } while (codeExists);
+
+    // Code expires 24 hours from now
+    const codeExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    const reservation = await Reservation.create({
+      foodItem:      foodItemId,
+      reserverName:  reserverName.trim(),
+      reserverPhone: reserverPhone.trim(),
+      reserverEmail: reserverEmail.trim().toLowerCase(),
+      quantity:      1,
+      code,
+      codeExpiresAt,
+      collected:     false,
+    });
+
+    // Check if this reservation fills up the item → auto sold out
+    const newCount = existingCount + 1;
+    if (newCount >= totalQty) {
+      food.approved = true;
+      await food.save();
+      console.log(`✅ Auto sold-out: ${food.foodItem} (${newCount}/${totalQty} reserved)`);
+    }
+
+    res.status(201).json({
+      message:       "Reservation confirmed!",
+      code,
+      codeExpiresAt,
+      reservationId: reservation._id,
+      foodItem:      food.foodItem,
+      location:      food.location,
+      spotsLeft:     Math.max(0, totalQty - newCount),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create reservation." });
+  }
+};
+app.post("/reservations",     handleCreateReservation);
+app.post("/api/reservations", handleCreateReservation);
+
+// GET /api/reservations/food/:foodItemId — get reservation count for a food item (public, no auth needed)
+const handleGetReservationCount = async (req, res) => {
+  try {
+    const food  = await WasteData.findById(req.params.foodItemId);
+    if (!food) return res.status(404).json({ error: "Food item not found." });
+
+    const count    = await Reservation.countDocuments({ foodItem: req.params.foodItemId });
+    const totalQty = Number(food.foodQuantity) || 1;
+    const spotsLeft = Math.max(0, totalQty - count);
+
+    res.json({
+      reserved:   count,
+      total:      totalQty,
+      spotsLeft,
+      isSoldOut:  food.approved || spotsLeft === 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch reservation count." });
+  }
+};
+app.get("/reservations/food/:foodItemId",     handleGetReservationCount);
+app.get("/api/reservations/food/:foodItemId", handleGetReservationCount);
+
+// POST /api/reservations/collect — donor verifies pickup code
+// Body: { code }
+const handleCollect = async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: "Pickup code is required." });
+
+    const reservation = await Reservation.findOne({ code: code.trim().toUpperCase() })
+      .populate("foodItem", "foodItem location");
+
+    if (!reservation)
+      return res.status(404).json({ error: "Invalid code. No reservation found." });
+
+    if (reservation.collected)
+      return res.status(400).json({ error: "This code has already been used for collection." });
+
+    // Check expiry (24h)
+    if (new Date() > reservation.codeExpiresAt)
+      return res.status(400).json({ error: "This pickup code has expired (24h limit)." });
+
+    reservation.collected = true;
+    await reservation.save();
+
+    res.json({
+      message:      "✅ Collection verified! Food handed over.",
+      reserverName: reservation.reserverName,
+      reserverPhone: reservation.reserverPhone,
+      foodItem:     reservation.foodItem?.foodItem,
+      location:     reservation.foodItem?.location,
+      collectedAt:  new Date(),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to verify code." });
+  }
+};
+app.post("/reservations/collect",     verifyToken, handleCollect);
+app.post("/api/reservations/collect", verifyToken, handleCollect);
+
+// GET /api/reservations/my — get reservations made by current user's phone/email
+// Used so user can see their active reservations (optional, nice-to-have)
+app.get("/api/reservations/my", verifyToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("email phone");
+    if (!user) return res.status(404).json({ error: "User not found." });
+
+    const reservations = await Reservation.find({
+      $or: [
+        { reserverEmail: user.email },
+        ...(user.phone ? [{ reserverPhone: user.phone }] : []),
+      ],
+    })
+      .populate("foodItem", "foodItem location foodWasteDate image")
+      .sort({ createdAt: -1 });
+
+    res.json(reservations);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch your reservations." });
+  }
+});
+
+/* ═══════════════════════════════
    GLOBAL ERROR HANDLER
 ═══════════════════════════════ */
 app.use((err, req, res, next) => {
