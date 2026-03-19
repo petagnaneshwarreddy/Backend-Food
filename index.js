@@ -1080,6 +1080,133 @@ const handleResendCode = async (req, res) => {
 app.post("/reservations/resend-code",     verifyToken, handleResendCode);
 app.post("/api/reservations/resend-code", verifyToken, handleResendCode);
 
+
+/* ─────────────────────────────────────────────────────────────
+   GET /api/reservations/search-by-user
+   Collector forgot code → searches by userId or phone →
+   returns their active (not collected, not expired) reservations
+   so they can pick which item to resend the code for.
+
+   Query: ?q=PXXX7  OR  ?q=9876543210
+─────────────────────────────────────────────────────────────── */
+app.get("/api/reservations/search-by-user", verifyToken, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.trim().length < 3)
+      return res.status(400).json({ error: "Please provide a User ID or phone number (min 3 chars)." });
+
+    const query = q.trim();
+
+    // Find user by userId OR phone (case-insensitive)
+    const User = mongoose.model("User");
+    const user = await User.findOne({
+      $or: [
+        { userId:  { $regex: new RegExp(`^${query}$`, "i") } },
+        { phone:   query },
+        { phone:   { $regex: query } },
+      ],
+    }).select("_id username userId phone email");
+
+    if (!user)
+      return res.status(404).json({ error: `No user found with User ID or phone "${query}". Please check and try again.` });
+
+    // Find their active reservations (not collected, not expired)
+    const reservations = await Reservation.find({
+      reserverId:    user._id,
+      collected:     false,
+      codeExpiresAt: { $gt: new Date() },
+    })
+      .populate("foodItem", "foodItem foodQuantity location")
+      .sort({ createdAt: -1 })
+      .limit(10);
+
+    if (!reservations.length)
+      return res.status(404).json({ error: `No active reservations found for this user. Codes may have expired or all pickups are complete.` });
+
+    // Shape the response
+    const shaped = reservations.map(r => ({
+      _id:           r._id,
+      reserverName:  r.reserverName,
+      code:          r.code,
+      codeExpiresAt: r.codeExpiresAt,
+      foodItem:      r.foodItem?.foodItem || "Unknown Item",
+      foodQuantity:  r.foodItem?.foodQuantity,
+      location:      r.foodItem?.location,
+      foodItemId:    r.foodItem?._id,
+    }));
+
+    res.json({
+      name:         user.username || user.userId,
+      userId:       user.userId,
+      phone:        user.phone,
+      reservations: shaped,
+    });
+
+  } catch (err) {
+    console.error("search-by-user error:", err);
+    res.status(500).json({ error: "Server error. Please try again." });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────
+   POST /api/reservations/resend-code-by-id
+   After collector selects their specific reservation,
+   send the donor a notification with the pickup code.
+
+   Body: { reservationId: "..." }
+─────────────────────────────────────────────────────────────── */
+app.post("/api/reservations/resend-code-by-id", verifyToken, async (req, res) => {
+  try {
+    const { reservationId } = req.body;
+    if (!reservationId)
+      return res.status(400).json({ error: "reservationId is required." });
+
+    // Find reservation
+    const reservation = await Reservation.findById(reservationId)
+      .populate({
+        path: "foodItem",
+        populate: { path: "user", select: "username _id" },
+      });
+
+    if (!reservation)
+      return res.status(404).json({ error: "Reservation not found." });
+
+    if (reservation.collected)
+      return res.status(400).json({ error: "This item has already been collected." });
+
+    if (reservation.codeExpiresAt < new Date())
+      return res.status(410).json({ error: "This pickup code has expired (24h limit). Please make a new reservation." });
+
+    const food  = reservation.foodItem;
+    const donor = food?.user;
+
+    if (!donor)
+      return res.status(404).json({ error: "Could not find the donor for this reservation." });
+
+    // Create notification for donor
+    await Notification.create({
+      recipient: donor._id,
+      title:     "📦 Code Resend Request",
+      message:   `${reservation.reserverName} forgot their pickup code for "${food?.foodItem || "your item"}". Their code is below — tap to copy and read it to them.`,
+      code:      reservation.code,
+      type:      "code_resend",
+      read:      false,
+    });
+
+    console.log(`✅ resend-code-by-id: notification sent to donor ${donor.username} for reservation ${reservationId}`);
+
+    res.json({
+      message: `✓ Notification sent to ${donor.username || "the donor"}! They will see the code in their notification bell.`,
+      donorName: donor.username,
+      foodItem:  food?.foodItem,
+    });
+
+  } catch (err) {
+    console.error("resend-code-by-id error:", err);
+    res.status(500).json({ error: "Server error. Please try again." });
+  }
+});
+
 /* ═══════════════════════════════
    GLOBAL ERROR HANDLER
 ═══════════════════════════════ */
