@@ -24,8 +24,6 @@ const MONGO_URI  = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/feedfor
 
 /* ===========================
    CORS — FIRST (before everything)
-   Ensures OPTIONS preflight never
-   gets blocked by rate limiter
 =========================== */
 const allowedOrigins = [
   process.env.FRONTEND_URL,
@@ -34,7 +32,6 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
     console.log("❌ CORS Blocked:", origin);
@@ -45,7 +42,7 @@ const corsOptions = {
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
-app.options("*", cors(corsOptions)); // preflight before all other middleware
+app.options("*", cors(corsOptions));
 app.use(cors(corsOptions));
 
 /* ===========================
@@ -56,7 +53,7 @@ app.use(helmet());
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
-  skip: (req) => req.method === "OPTIONS", // never rate-limit preflight
+  skip: (req) => req.method === "OPTIONS",
   standardHeaders: true,
   legacyHeaders: false,
 }));
@@ -71,7 +68,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve uploads on both paths so frontend works regardless of URL used
 app.use("/uploads",     express.static(path.join(__dirname, "uploads")));
 app.use("/api/uploads", express.static(path.join(__dirname, "uploads")));
 
@@ -91,15 +87,47 @@ mongoose.connect(MONGO_URI, {
 });
 
 /* ===========================
+   HELPER — generate short human-readable user ID
+   Format: FF-XXXXXX  (FF = FeedForward prefix, 6 alphanumeric chars)
+   e.g.  FF-A3K9PZ
+=========================== */
+const generateUserId = () => {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid confusion
+  let id = "FF-";
+  for (let i = 0; i < 6; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
+};
+
+/* ===========================
    MODELS
 =========================== */
-const User = mongoose.model("User", new mongoose.Schema({
+const UserSchema = new mongoose.Schema({
+  userId:     { type: String, unique: true },          // ← NEW: readable unique ID e.g. FF-A3K9PZ
   username:   { type: String, required: true },
   email:      { type: String, unique: true, required: true },
   phone:      { type: String, default: "" },
+  gender:     {                                         // ← NEW: stored from signup form
+    type: String,
+    enum: ["male", "female", "other", "prefer_not", ""],
+    default: "",
+  },
   password:   { type: String, required: true },
   resetToken: { type: String, default: null },
-}, { timestamps: true })); // ← adds createdAt & updatedAt automatically
+}, { timestamps: true }); // createdAt + updatedAt
+
+// Auto-generate userId before saving if not already set
+UserSchema.pre("save", async function (next) {
+  if (this.userId) return next();
+  let uid, exists;
+  do {
+    uid = generateUserId();
+    exists = await mongoose.model("User").findOne({ userId: uid });
+  } while (exists);
+  this.userId = uid;
+  next();
+});
+
+const User = mongoose.model("User", UserSchema);
 
 const WasteData = mongoose.model("WasteData", new mongoose.Schema({
   user:          { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -110,7 +138,7 @@ const WasteData = mongoose.model("WasteData", new mongoose.Schema({
   location:      String,
   image:         String,
   approved:      { type: Boolean, default: false },
-}, { strict: false })); // strict:false allows existing docs without approved field to be queried
+}, { strict: false }));
 
 const Inventory = mongoose.model("Inventory", new mongoose.Schema({
   user:             { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -124,8 +152,6 @@ const Inventory = mongoose.model("Inventory", new mongoose.Schema({
 
 /* ===========================
    MULTER + CLOUDINARY
-   Uses Cloudinary in production (permanent URLs, survives Render redeploys)
-   Falls back to local disk if CLOUDINARY env vars not set
 =========================== */
 let upload;
 
@@ -162,7 +188,7 @@ if (process.env.CLOUDINARY_CLOUD_NAME) {
     },
   });
   upload = multer({ storage: diskStorage, limits: { fileSize: 5 * 1024 * 1024 } });
-  console.log("💾 Local disk storage (set CLOUDINARY_* env vars for production)");
+  console.log("💾 Local disk storage");
 }
 
 /* ===========================
@@ -219,10 +245,8 @@ const sendPasswordResetEmail = async (email, token) => {
 =========================== */
 app.get("/", (req, res) => res.send("🚀 FeedForward API Running"));
 
-// Wake-up ping — frontend calls this on load to warm up Render free tier
 app.get("/api/ping", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Refresh token — returns fresh 7d token if current is still valid
 app.get("/api/refresh-token", verifyToken, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select("_id email username");
@@ -236,14 +260,12 @@ app.get("/api/refresh-token", verifyToken, async (req, res) => {
 
 /* ===========================
    AUTH ROUTES
-   Supports both /register and /api/register
-   so old and new frontend code both work
 =========================== */
 
-// Register
+// Register — now also saves gender
 const handleRegister = async (req, res) => {
   try {
-    const { username, email, password, phone } = req.body;
+    const { username, email, password, phone, gender } = req.body;
 
     if (!username || !email || !password)
       return res.status(400).json({ error: "All fields required" });
@@ -255,9 +277,20 @@ const handleRegister = async (req, res) => {
       return res.status(409).json({ error: "Email already registered" });
 
     const hash = await bcrypt.hash(password, 10);
-    await new User({ username, email, password: hash, phone: phone || "" }).save();
+    const newUser = new User({
+      username,
+      email,
+      password: hash,
+      phone:  phone  || "",
+      gender: gender || "",
+      // userId is auto-generated by the pre-save hook
+    });
+    await newUser.save();
 
-    res.status(201).json({ message: "Registered successfully" });
+    res.status(201).json({
+      message: "Registered successfully",
+      userId:  newUser.userId, // return it so frontend can show it immediately if needed
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Registration failed" });
@@ -278,7 +311,6 @@ const handleLogin = async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(400).json({ error: "Invalid credentials" });
 
-    // 7d so users stay logged in — frontend checks expiry and refreshes
     const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ token });
   } catch (err) {
@@ -335,12 +367,11 @@ app.post("/reset-password/:token",     handleResetPassword);
 app.post("/api/reset-password/:token", handleResetPassword);
 
 /* ===========================
-   PROFILE ROUTES  ← NEW
-   GET  /api/profile  — fetch logged-in user's info (no password/resetToken)
-   PUT  /api/profile  — update username and/or phone (email is immutable)
+   PROFILE ROUTES
+   GET  /api/profile  — return full user info (no password / resetToken)
+   PUT  /api/profile  — update username, phone, gender
 =========================== */
 
-// GET — return user data safe for frontend
 app.get("/api/profile", verifyToken, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select("-password -resetToken");
@@ -352,19 +383,23 @@ app.get("/api/profile", verifyToken, async (req, res) => {
   }
 });
 
-// PUT — only username and phone are editable; email cannot change
 app.put("/api/profile", verifyToken, async (req, res) => {
   try {
-    const { username, phone } = req.body;
+    const { username, phone, gender } = req.body;
 
     if (!username || username.trim().length < 2)
       return res.status(400).json({ error: "Username must be at least 2 characters" });
+
+    const allowedGenders = ["male", "female", "other", "prefer_not", ""];
+    if (gender !== undefined && !allowedGenders.includes(gender))
+      return res.status(400).json({ error: "Invalid gender value" });
 
     const updated = await User.findByIdAndUpdate(
       req.userId,
       {
         username: username.trim(),
-        phone:    (phone || "").trim(),
+        phone:    (phone  || "").trim(),
+        gender:   gender  || "",
       },
       { new: true, runValidators: true }
     ).select("-password -resetToken");
@@ -380,10 +415,8 @@ app.put("/api/profile", verifyToken, async (req, res) => {
 
 /* ===========================
    WASTE ROUTES
-   Supports both /waste and /api/waste
 =========================== */
 
-// Create
 const handleCreateWaste = async (req, res) => {
   try {
     const { foodItem, foodQuantity, foodReason, foodWasteDate, location } = req.body;
@@ -394,7 +427,6 @@ const handleCreateWaste = async (req, res) => {
     const waste = new WasteData({
       user: req.userId,
       foodItem, foodQuantity, foodReason, foodWasteDate, location,
-      // Cloudinary returns req.file.path (full URL), local disk returns req.file.filename
       image: req.file ? (req.file.path || req.file.filename) : null,
     });
     await waste.save();
@@ -407,11 +439,9 @@ const handleCreateWaste = async (req, res) => {
 app.post("/waste",     verifyToken, upload.single("image"), handleCreateWaste);
 app.post("/api/waste", verifyToken, upload.single("image"), handleCreateWaste);
 
-// Read
 const handleGetWaste = async (req, res) => {
   try {
     const data = await WasteData.find({ user: req.userId }).sort({ foodWasteDate: -1 });
-    // Ensure approved field is always present (coerce missing/null to false)
     const normalized = data.map(item => {
       const obj = item.toObject();
       if (obj.approved === undefined || obj.approved === null) obj.approved = false;
@@ -425,20 +455,14 @@ const handleGetWaste = async (req, res) => {
 app.get("/waste",     verifyToken, handleGetWaste);
 app.get("/api/waste", verifyToken, handleGetWaste);
 
-// Delete
 const handleDeleteWaste = async (req, res) => {
   try {
     const waste = await WasteData.findOne({ _id: req.params.id, user: req.userId });
     if (!waste) return res.status(404).json({ error: "Waste item not found" });
 
-    if (waste.image) {
-      // If it's a local file (not a Cloudinary URL), delete from disk
-      if (!waste.image.startsWith("http")) {
-        const imgPath = path.join(__dirname, "uploads", waste.image);
-        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
-      }
-      // Note: Cloudinary images are identified by full https:// URL
-      // To also delete from Cloudinary, you'd use cloudinary.uploader.destroy(publicId)
+    if (waste.image && !waste.image.startsWith("http")) {
+      const imgPath = path.join(__dirname, "uploads", waste.image);
+      if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
     }
 
     await waste.deleteOne();
@@ -451,15 +475,13 @@ const handleDeleteWaste = async (req, res) => {
 app.delete("/waste/:id",     verifyToken, handleDeleteWaste);
 app.delete("/api/waste/:id", verifyToken, handleDeleteWaste);
 
-// Approve
 const handleApproveWaste = async (req, res) => {
   try {
     const waste = await WasteData.findOne({ _id: req.params.id, user: req.userId });
     if (!waste) return res.status(404).json({ error: "Waste item not found" });
     if (waste.approved) return res.status(400).json({ error: "Already approved" });
 
-    waste.approved = true;
-    // Use quantity from request body if provided, otherwise reduce by 10%
+    waste.approved     = true;
     waste.foodQuantity = req.body.foodQuantity !== undefined
       ? req.body.foodQuantity
       : Math.floor(waste.foodQuantity * 0.9);
@@ -476,10 +498,8 @@ app.patch("/api/waste/approve/:id", verifyToken, handleApproveWaste);
 
 /* ===========================
    INVENTORY ROUTES
-   Supports both /inventory and /api/inventory
 =========================== */
 
-// Create
 const handleCreateInventory = async (req, res) => {
   try {
     const { itemName, itemQuantity, itemCost, itemPurchaseDate, itemExpiryDate } = req.body;
@@ -501,7 +521,6 @@ const handleCreateInventory = async (req, res) => {
 app.post("/inventory",     verifyToken, handleCreateInventory);
 app.post("/api/inventory", verifyToken, handleCreateInventory);
 
-// Read
 const handleGetInventory = async (req, res) => {
   try {
     res.json(await Inventory.find({ user: req.userId }));
@@ -512,7 +531,6 @@ const handleGetInventory = async (req, res) => {
 app.get("/inventory",     verifyToken, handleGetInventory);
 app.get("/api/inventory", verifyToken, handleGetInventory);
 
-// Update quantity
 const handleUpdateInventory = async (req, res) => {
   try {
     const item = await Inventory.findOne({ _id: req.params.id, user: req.userId });
@@ -528,7 +546,6 @@ const handleUpdateInventory = async (req, res) => {
 app.patch("/inventory/:id",     verifyToken, handleUpdateInventory);
 app.patch("/api/inventory/:id", verifyToken, handleUpdateInventory);
 
-// Delete
 const handleDeleteInventory = async (req, res) => {
   try {
     const item = await Inventory.findOneAndDelete({ _id: req.params.id, user: req.userId });
@@ -541,7 +558,6 @@ const handleDeleteInventory = async (req, res) => {
 app.delete("/inventory/:id",     verifyToken, handleDeleteInventory);
 app.delete("/api/inventory/:id", verifyToken, handleDeleteInventory);
 
-// Approve/consume inventory
 const handleApproveInventory = async (req, res) => {
   try {
     const item = await Inventory.findOne({ _id: req.params.id, user: req.userId });
