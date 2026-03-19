@@ -16,15 +16,10 @@ const recipeRoutes = require("./routes/recipes");
 const app  = express();
 const port = process.env.PORT || 5000;
 
-/* ===========================
-   ENV
-=========================== */
 const JWT_SECRET = process.env.JWT_SECRET || "your_secret_key";
 const MONGO_URI  = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/feedforward";
 
-/* ===========================
-   CORS
-=========================== */
+/* ── CORS ── */
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   "http://localhost:3000",
@@ -34,89 +29,55 @@ const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    console.log("❌ CORS Blocked:", origin);
+    console.log("CORS Blocked:", origin);
     callback(new Error("CORS blocked"));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
-
 app.options("*", cors(corsOptions));
 app.use(cors(corsOptions));
 
-/* ===========================
-   SECURITY
-=========================== */
+/* ── SECURITY ── */
 app.use(helmet());
-
 app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
+  windowMs: 15 * 60 * 1000, max: 100,
   skip: (req) => req.method === "OPTIONS",
-  standardHeaders: true,
-  legacyHeaders: false,
+  standardHeaders: true, legacyHeaders: false,
 }));
 
-/* ===========================
-   MIDDLEWARE
-=========================== */
+/* ── MIDDLEWARE ── */
 app.use(express.json());
-
-app.use((req, res, next) => {
-  console.log(`➡️  ${req.method} ${req.url}`);
-  next();
-});
-
+app.use((req, res, next) => { console.log(`${req.method} ${req.url}`); next(); });
 app.use("/uploads",     express.static(path.join(__dirname, "uploads")));
 app.use("/api/uploads", express.static(path.join(__dirname, "uploads")));
-
 app.use("/api/recipes", recipeRoutes);
 
-/* ===========================
-   DATABASE
-=========================== */
-mongoose.connect(MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log("✅ MongoDB Connected"))
-.catch((err) => {
-  console.error("❌ DB Error:", err.message);
-  process.exit(1);
-});
+/* ── DATABASE ── */
+mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log("MongoDB Connected"))
+  .catch((err) => { console.error("DB Error:", err.message); process.exit(1); });
 
-/* ===========================
-   HELPER — generate unique readable user ID
-   Format: FF-XXXXXX  e.g. FF-A3K9PZ
-=========================== */
+/* ── HELPER: generate 5-char userId ── */
 const generateUserId = () => {
-  // 5-character alphanumeric ID — no confusing chars (0/O, 1/I)
-  // e.g. A3K9P, ZX72M, B5RQN
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let id = "";
   for (let i = 0; i < 5; i++) id += chars[Math.floor(Math.random() * chars.length)];
   return id;
 };
 
-/* ===========================
-   MODELS
-=========================== */
+/* ── MODELS ── */
 const UserSchema = new mongoose.Schema({
   userId:     { type: String, unique: true },
   username:   { type: String, required: true },
   email:      { type: String, unique: true, required: true },
   phone:      { type: String, default: "" },
-  gender:     {
-    type: String,
-    enum: ["male", "female", "other", "prefer_not", ""],
-    default: "",
-  },
+  gender:     { type: String, enum: ["male", "female", "other", "prefer_not", ""], default: "" },
   password:   { type: String, required: true },
   resetToken: { type: String, default: null },
 }, { timestamps: true });
 
-// Auto-generate userId before first save
 UserSchema.pre("save", async function (next) {
   if (this.userId) return next();
   let uid, exists;
@@ -151,32 +112,26 @@ const Inventory = mongoose.model("Inventory", new mongoose.Schema({
   consumed:         { type: Boolean, default: false },
 }));
 
-/* ===========================
-   MULTER + CLOUDINARY
-=========================== */
+/* ── MULTER + CLOUDINARY ── */
 let upload;
-
 if (process.env.CLOUDINARY_CLOUD_NAME) {
   const cloudinary = require("cloudinary").v2;
   const { CloudinaryStorage } = require("multer-storage-cloudinary");
-
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key:    process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET,
   });
-
   const cloudStorage = new CloudinaryStorage({
     cloudinary,
     params: {
-      folder:          "feedforward",
+      folder: "feedforward",
       allowed_formats: ["jpg", "jpeg", "png", "webp", "gif"],
-      transformation:  [{ width: 800, height: 800, crop: "limit", quality: "auto" }],
+      transformation: [{ width: 800, height: 800, crop: "limit", quality: "auto" }],
     },
   });
-
   upload = multer({ storage: cloudStorage, limits: { fileSize: 5 * 1024 * 1024 } });
-  console.log("☁️  Cloudinary storage enabled");
+  console.log("Cloudinary storage enabled");
 } else {
   const diskStorage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -184,22 +139,17 @@ if (process.env.CLOUDINARY_CLOUD_NAME) {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir);
       cb(null, dir);
     },
-    filename: (req, file, cb) => {
-      cb(null, `${Date.now()}-${file.originalname}`);
-    },
+    filename: (req, file, cb) => { cb(null, `${Date.now()}-${file.originalname}`); },
   });
   upload = multer({ storage: diskStorage, limits: { fileSize: 5 * 1024 * 1024 } });
-  console.log("💾 Local disk storage");
+  console.log("Local disk storage");
 }
 
-/* ===========================
-   JWT MIDDLEWARE
-=========================== */
+/* ── JWT MIDDLEWARE ── */
 const verifyToken = (req, res, next) => {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer "))
     return res.status(401).json({ error: "Unauthorized - No token" });
-
   const token = header.split(" ")[1];
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(401).json({ error: "Invalid token" });
@@ -208,9 +158,7 @@ const verifyToken = (req, res, next) => {
   });
 };
 
-/* ===========================
-   EMAIL
-=========================== */
+/* ── EMAIL ── */
 const sendPasswordResetEmail = async (email, token) => {
   const transporter = nodemailer.createTransport({
     service: "gmail",
@@ -219,7 +167,6 @@ const sendPasswordResetEmail = async (email, token) => {
       pass: process.env.EMAIL_PASS || process.env.EMAIL_PASSWORD,
     },
   });
-
   const url = `${process.env.FRONTEND_URL}/reset-password/${token}`;
   await transporter.sendMail({
     from: process.env.EMAIL_USER || process.env.EMAIL,
@@ -241,11 +188,10 @@ const sendPasswordResetEmail = async (email, token) => {
   });
 };
 
-/* ===========================
+/* ═══════════════════════════════
    HEALTH
-=========================== */
-app.get("/", (req, res) => res.send("🚀 FeedForward API Running"));
-
+═══════════════════════════════ */
+app.get("/", (req, res) => res.send("FeedForward API Running"));
 app.get("/api/ping", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get("/api/refresh-token", verifyToken, async (req, res) => {
@@ -254,178 +200,120 @@ app.get("/api/refresh-token", verifyToken, async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
     const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ token });
-  } catch {
-    res.status(500).json({ error: "Could not refresh token" });
-  }
+  } catch { res.status(500).json({ error: "Could not refresh token" }); }
 });
 
-/* ===========================
-   AUTH ROUTES
-=========================== */
-
-// Register — saves gender, auto-generates userId via pre-save hook
+/* ═══════════════════════════════
+   AUTH
+═══════════════════════════════ */
 const handleRegister = async (req, res) => {
   try {
     const { username, email, password, phone, gender } = req.body;
-
     if (!username || !email || !password)
       return res.status(400).json({ error: "All fields required" });
-
     if (password.length < 6)
       return res.status(400).json({ error: "Password too short (min 6 chars)" });
-
     if (await User.findOne({ email }))
       return res.status(409).json({ error: "Email already registered" });
 
     const hash    = await bcrypt.hash(password, 10);
-    const newUser = new User({
-      username,
-      email,
-      password: hash,
-      phone:  phone  || "",
-      gender: gender || "",
-    });
+    const newUser = new User({ username, email, password: hash, phone: phone || "", gender: gender || "" });
     await newUser.save();
-
-    res.status(201).json({
-      message: "Registered successfully",
-      userId:  newUser.userId,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Registration failed" });
-  }
+    res.status(201).json({ message: "Registered successfully", userId: newUser.userId });
+  } catch (err) { console.error(err); res.status(500).json({ error: "Registration failed" }); }
 };
 app.post("/register",     handleRegister);
 app.post("/api/register", handleRegister);
 
-// Login
 const handleLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)
       return res.status(400).json({ error: "Email and password required" });
-
     const user = await User.findOne({ email });
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(400).json({ error: "Invalid credentials" });
-
     const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ token });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Login failed" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Login failed" }); }
 };
 app.post("/login",     handleLogin);
 app.post("/api/login", handleLogin);
 
-// Forgot Password
 const handleForgotPassword = async (req, res) => {
   try {
     const user = await User.findOne({ email: req.body.email });
     if (!user) return res.status(404).json({ error: "User not found" });
-
     const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "1h" });
     user.resetToken = token;
     await user.save();
-
     await sendPasswordResetEmail(user.email, token);
     res.json({ message: "Reset link sent to your email" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to send reset email" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Failed to send reset email" }); }
 };
 app.post("/forgot-password",     handleForgotPassword);
 app.post("/api/forgot-password", handleForgotPassword);
 
-// Reset Password
 const handleResetPassword = async (req, res) => {
   try {
     const decoded = jwt.verify(req.params.token, JWT_SECRET);
     const user    = await User.findById(decoded.userId);
-
     if (!user || user.resetToken !== req.params.token)
       return res.status(400).json({ error: "Invalid or expired token" });
-
     if (!req.body.password || req.body.password.length < 6)
       return res.status(400).json({ error: "Password too short (min 6 chars)" });
-
     user.password   = await bcrypt.hash(req.body.password, 10);
     user.resetToken = null;
     await user.save();
-
     res.json({ message: "Password reset successful" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Reset failed" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Reset failed" }); }
 };
 app.post("/reset-password/:token",     handleResetPassword);
 app.post("/api/reset-password/:token", handleResetPassword);
 
-/* ===========================
-   PROFILE ROUTES
-=========================== */
-
-// GET — return logged-in user's data (no password/resetToken)
+/* ═══════════════════════════════
+   PROFILE
+═══════════════════════════════ */
 app.get("/api/profile", verifyToken, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select("-password -resetToken");
     if (!user) return res.status(404).json({ error: "User not found" });
     res.json(user);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch profile" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Failed to fetch profile" }); }
 });
 
-// PUT — update username, phone, gender (email & userId are immutable)
 app.put("/api/profile", verifyToken, async (req, res) => {
   try {
     const { username, phone, gender } = req.body;
-
     if (!username || username.trim().length < 2)
       return res.status(400).json({ error: "Username must be at least 2 characters" });
-
     const allowedGenders = ["male", "female", "other", "prefer_not", ""];
     if (gender !== undefined && !allowedGenders.includes(gender))
       return res.status(400).json({ error: "Invalid gender value" });
-
     const updated = await User.findByIdAndUpdate(
       req.userId,
-      {
-        username: username.trim(),
-        phone:    (phone  || "").trim(),
-        gender:   gender  || "",
-      },
+      { username: username.trim(), phone: (phone || "").trim(), gender: gender || "" },
       { new: true, runValidators: true }
     ).select("-password -resetToken");
-
     if (!updated) return res.status(404).json({ error: "User not found" });
     res.json(updated);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update profile" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Failed to update profile" }); }
 });
 
-/* ===========================
-   WASTE ROUTES
-=========================== */
-
-// ── PUBLIC FEED ── GET /api/waste/feed
-// Returns ALL users' waste entries (with donor name + userId) so the
-// Display page can show donations from every user, not just the logged-in one.
-// Requires a valid token so anonymous visitors can't scrape it,
-// but does NOT filter by userId.
-app.get("/api/waste/feed", verifyToken, async (req, res) => {
+/* ═══════════════════════════════
+   WASTE — COMMUNITY FEED
+   GET /waste/feed  AND  /api/waste/feed
+   Returns ALL users' entries so Display
+   page shows everyone's donations.
+   IMPORTANT: must be registered BEFORE
+   the generic /api/waste route.
+═══════════════════════════════ */
+const handleGetFeed = async (req, res) => {
   try {
     const data = await WasteData.find({})
       .sort({ foodWasteDate: -1 })
-      .limit(200)                        // safety cap — raise if needed
-      .populate("user", "username userId"); // attach donor name & ID
+      .limit(500)
+      .populate("user", "username userId");
 
     const normalized = data.map(item => {
       const obj = item.toObject();
@@ -436,11 +324,19 @@ app.get("/api/waste/feed", verifyToken, async (req, res) => {
     res.json(normalized);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to fetch public feed" });
+    res.status(500).json({ error: "Failed to fetch community feed" });
   }
-});
+};
+// Register BOTH paths — same pattern as every other route
+app.get("/waste/feed",     verifyToken, handleGetFeed);
+app.get("/api/waste/feed", verifyToken, handleGetFeed);
 
-// ── MY WASTE ── GET /api/waste  (only logged-in user's entries)
+/* ═══════════════════════════════
+   WASTE — MY ENTRIES ONLY
+   GET /waste  AND  /api/waste
+   Returns only the logged-in user's entries
+   (used by Waste.jsx form page & Profile stats)
+═══════════════════════════════ */
 const handleGetWaste = async (req, res) => {
   try {
     const data = await WasteData.find({ user: req.userId }).sort({ foodWasteDate: -1 });
@@ -450,103 +346,78 @@ const handleGetWaste = async (req, res) => {
       return obj;
     });
     res.json(normalized);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch waste data" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to fetch waste data" }); }
 };
 app.get("/waste",     verifyToken, handleGetWaste);
 app.get("/api/waste", verifyToken, handleGetWaste);
 
-// Create
+/* ── CREATE ── */
 const handleCreateWaste = async (req, res) => {
   try {
     const { foodItem, foodQuantity, foodReason, foodWasteDate, location } = req.body;
-
     if (!foodItem || !foodQuantity || !foodReason || !foodWasteDate || !location)
       return res.status(400).json({ error: "All fields are required" });
-
     const waste = new WasteData({
-      user: req.userId,
-      foodItem, foodQuantity, foodReason, foodWasteDate, location,
+      user: req.userId, foodItem, foodQuantity, foodReason, foodWasteDate, location,
       image: req.file ? (req.file.path || req.file.filename) : null,
     });
     await waste.save();
-
-    // Re-fetch with populated user so frontend gets donor info immediately
+    // Return with populated user so frontend gets donor info immediately
     const populated = await WasteData.findById(waste._id).populate("user", "username userId");
     res.status(201).json(populated);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to save waste entry" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Failed to save waste entry" }); }
 };
 app.post("/waste",     verifyToken, upload.single("image"), handleCreateWaste);
 app.post("/api/waste", verifyToken, upload.single("image"), handleCreateWaste);
 
-// Delete
+/* ── DELETE ── */
 const handleDeleteWaste = async (req, res) => {
   try {
     const waste = await WasteData.findOne({ _id: req.params.id, user: req.userId });
     if (!waste) return res.status(404).json({ error: "Waste item not found" });
-
     if (waste.image && !waste.image.startsWith("http")) {
       const imgPath = path.join(__dirname, "uploads", waste.image);
       if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
     }
-
     await waste.deleteOne();
     res.json({ message: `"${waste.foodItem}" deleted successfully` });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to delete waste item" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Failed to delete waste item" }); }
 };
 app.delete("/waste/:id",     verifyToken, handleDeleteWaste);
 app.delete("/api/waste/:id", verifyToken, handleDeleteWaste);
 
-// Approve
+/* ── APPROVE ── */
 const handleApproveWaste = async (req, res) => {
   try {
     const waste = await WasteData.findOne({ _id: req.params.id, user: req.userId });
     if (!waste) return res.status(404).json({ error: "Waste item not found" });
     if (waste.approved) return res.status(400).json({ error: "Already approved" });
-
     waste.approved     = true;
     waste.foodQuantity = req.body.foodQuantity !== undefined
       ? req.body.foodQuantity
       : Math.floor(waste.foodQuantity * 0.9);
-
     await waste.save();
     res.json({ message: "Food item approved", data: waste });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Approval failed" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Approval failed" }); }
 };
 app.patch("/waste/approve/:id",     verifyToken, handleApproveWaste);
 app.patch("/api/waste/approve/:id", verifyToken, handleApproveWaste);
 
-/* ===========================
-   INVENTORY ROUTES
-=========================== */
-
+/* ═══════════════════════════════
+   INVENTORY
+═══════════════════════════════ */
 const handleCreateInventory = async (req, res) => {
   try {
     const { itemName, itemQuantity, itemCost, itemPurchaseDate, itemExpiryDate } = req.body;
-
     if (!itemName || !itemQuantity || !itemCost || !itemPurchaseDate || !itemExpiryDate)
       return res.status(400).json({ error: "All fields are required" });
-
     const item = new Inventory({
-      user: req.userId,
-      itemName, itemQuantity, itemCost, itemPurchaseDate, itemExpiryDate,
-      consumed: false,
+      user: req.userId, itemName, itemQuantity, itemCost,
+      itemPurchaseDate, itemExpiryDate, consumed: false,
     });
     await item.save();
     res.status(201).json(item);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to add inventory item" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to add inventory item" }); }
 };
 app.post("/inventory",     verifyToken, handleCreateInventory);
 app.post("/api/inventory", verifyToken, handleCreateInventory);
@@ -554,9 +425,7 @@ app.post("/api/inventory", verifyToken, handleCreateInventory);
 const handleGetInventory = async (req, res) => {
   try {
     res.json(await Inventory.find({ user: req.userId }));
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch inventory" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to fetch inventory" }); }
 };
 app.get("/inventory",     verifyToken, handleGetInventory);
 app.get("/api/inventory", verifyToken, handleGetInventory);
@@ -568,9 +437,7 @@ const handleUpdateInventory = async (req, res) => {
     if (req.body.itemQuantity !== undefined) item.itemQuantity = req.body.itemQuantity;
     await item.save();
     res.json({ message: "Inventory item updated", data: item });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to update inventory item" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to update inventory item" }); }
 };
 app.patch("/inventory/:id",     verifyToken, handleUpdateInventory);
 app.patch("/api/inventory/:id", verifyToken, handleUpdateInventory);
@@ -580,9 +447,7 @@ const handleDeleteInventory = async (req, res) => {
     const item = await Inventory.findOneAndDelete({ _id: req.params.id, user: req.userId });
     if (!item) return res.status(404).json({ error: "Inventory item not found" });
     res.json({ message: `"${item.itemName}" deleted successfully` });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to delete inventory item" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to delete inventory item" }); }
 };
 app.delete("/inventory/:id",     verifyToken, handleDeleteInventory);
 app.delete("/api/inventory/:id", verifyToken, handleDeleteInventory);
@@ -595,26 +460,20 @@ const handleApproveInventory = async (req, res) => {
     item.consumed = true;
     await item.save();
     res.json({ message: "Inventory item consumed", data: item });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to approve inventory item" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to approve inventory item" }); }
 };
 app.patch("/inventory/approve/:id",     verifyToken, handleApproveInventory);
 app.patch("/api/inventory/approve/:id", verifyToken, handleApproveInventory);
 
-/* ===========================
-   GLOBAL ERROR HANDLER
-=========================== */
+/* ── GLOBAL ERROR HANDLER ── */
 app.use((err, req, res, next) => {
-  console.error("❌ Error:", err.message);
+  console.error("Error:", err.message);
   if (err.message === "CORS blocked")
     return res.status(403).json({ error: "CORS blocked" });
   res.status(500).json({ error: "Internal server error" });
 });
 
-/* ===========================
-   START
-=========================== */
+/* ── START ── */
 app.listen(port, () => {
-  console.log(`🚀 FeedForward API running on port ${port}`);
+  console.log(`FeedForward API running on port ${port}`);
 });
