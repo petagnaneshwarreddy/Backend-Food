@@ -99,7 +99,7 @@ const User = mongoose.model("User", new mongoose.Schema({
   phone:      { type: String, default: "" },
   password:   { type: String, required: true },
   resetToken: { type: String, default: null },
-}));
+}, { timestamps: true })); // ← adds createdAt & updatedAt automatically
 
 const WasteData = mongoose.model("WasteData", new mongoose.Schema({
   user:          { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -333,6 +333,50 @@ const handleResetPassword = async (req, res) => {
 };
 app.post("/reset-password/:token",     handleResetPassword);
 app.post("/api/reset-password/:token", handleResetPassword);
+
+/* ===========================
+   PROFILE ROUTES  ← NEW
+   GET  /api/profile  — fetch logged-in user's info (no password/resetToken)
+   PUT  /api/profile  — update username and/or phone (email is immutable)
+=========================== */
+
+// GET — return user data safe for frontend
+app.get("/api/profile", verifyToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("-password -resetToken");
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch profile" });
+  }
+});
+
+// PUT — only username and phone are editable; email cannot change
+app.put("/api/profile", verifyToken, async (req, res) => {
+  try {
+    const { username, phone } = req.body;
+
+    if (!username || username.trim().length < 2)
+      return res.status(400).json({ error: "Username must be at least 2 characters" });
+
+    const updated = await User.findByIdAndUpdate(
+      req.userId,
+      {
+        username: username.trim(),
+        phone:    (phone || "").trim(),
+      },
+      { new: true, runValidators: true }
+    ).select("-password -resetToken");
+
+    if (!updated) return res.status(404).json({ error: "User not found" });
+
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update profile" });
+  }
+});
 
 /* ===========================
    WASTE ROUTES
