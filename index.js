@@ -123,23 +123,47 @@ const Inventory = mongoose.model("Inventory", new mongoose.Schema({
 }));
 
 /* ===========================
-   MULTER
+   MULTER + CLOUDINARY
+   Uses Cloudinary in production (permanent URLs, survives Render redeploys)
+   Falls back to local disk if CLOUDINARY env vars not set
 =========================== */
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = "./uploads";
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  },
-});
+let upload;
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
-});
+if (process.env.CLOUDINARY_CLOUD_NAME) {
+  const cloudinary = require("cloudinary").v2;
+  const { CloudinaryStorage } = require("multer-storage-cloudinary");
+
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key:    process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+
+  const cloudStorage = new CloudinaryStorage({
+    cloudinary,
+    params: {
+      folder:          "feedforward",
+      allowed_formats: ["jpg", "jpeg", "png", "webp", "gif"],
+      transformation:  [{ width: 800, height: 800, crop: "limit", quality: "auto" }],
+    },
+  });
+
+  upload = multer({ storage: cloudStorage, limits: { fileSize: 5 * 1024 * 1024 } });
+  console.log("☁️  Cloudinary storage enabled");
+} else {
+  const diskStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = "./uploads";
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+      cb(null, `${Date.now()}-${file.originalname}`);
+    },
+  });
+  upload = multer({ storage: diskStorage, limits: { fileSize: 5 * 1024 * 1024 } });
+  console.log("💾 Local disk storage (set CLOUDINARY_* env vars for production)");
+}
 
 /* ===========================
    JWT MIDDLEWARE
@@ -326,7 +350,8 @@ const handleCreateWaste = async (req, res) => {
     const waste = new WasteData({
       user: req.userId,
       foodItem, foodQuantity, foodReason, foodWasteDate, location,
-      image: req.file?.filename || null,
+      // Cloudinary returns req.file.path (full URL), local disk returns req.file.filename
+      image: req.file ? (req.file.path || req.file.filename) : null,
     });
     await waste.save();
     res.status(201).json(waste);
@@ -357,8 +382,13 @@ const handleDeleteWaste = async (req, res) => {
     if (!waste) return res.status(404).json({ error: "Waste item not found" });
 
     if (waste.image) {
-      const imgPath = path.join(__dirname, "uploads", waste.image);
-      if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+      // If it's a local file (not a Cloudinary URL), delete from disk
+      if (!waste.image.startsWith("http")) {
+        const imgPath = path.join(__dirname, "uploads", waste.image);
+        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+      }
+      // Note: Cloudinary images are identified by full https:// URL
+      // To also delete from Cloudinary, you'd use cloudinary.uploader.destroy(publicId)
     }
 
     await waste.deleteOne();
