@@ -468,7 +468,7 @@ const handleGetFeed = async (req, res) => {
     const data = await WasteData.find({})
       .sort({ foodWasteDate: -1 })
       .limit(500)
-      .populate("user", "username userId");
+      .populate("user", "username userId phone");
 
     const normalized = data.map(item => {
       const obj = item.toObject();
@@ -522,7 +522,7 @@ const handleCreateWaste = async (req, res) => {
     await waste.save();
 
     // Return populated so frontend immediately gets donor info
-    const populated = await WasteData.findById(waste._id).populate("user", "username userId");
+    const populated = await WasteData.findById(waste._id).populate("user", "username userId phone");
     res.status(201).json(populated);
   } catch (err) {
     console.error(err);
