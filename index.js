@@ -110,7 +110,7 @@ const WasteData = mongoose.model("WasteData", new mongoose.Schema({
   location:      String,
   image:         String,
   approved:      { type: Boolean, default: false },
-}));
+}, { strict: false })); // strict:false allows existing docs without approved field to be queried
 
 const Inventory = mongoose.model("Inventory", new mongoose.Schema({
   user:             { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -367,7 +367,13 @@ app.post("/api/waste", verifyToken, upload.single("image"), handleCreateWaste);
 const handleGetWaste = async (req, res) => {
   try {
     const data = await WasteData.find({ user: req.userId }).sort({ foodWasteDate: -1 });
-    res.json(data);
+    // Ensure approved field is always present (coerce missing/null to false)
+    const normalized = data.map(item => {
+      const obj = item.toObject();
+      if (obj.approved === undefined || obj.approved === null) obj.approved = false;
+      return obj;
+    });
+    res.json(normalized);
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch waste data" });
   }
