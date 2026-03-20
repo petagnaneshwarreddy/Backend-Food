@@ -98,16 +98,27 @@ const assignUserId = async (user) => {
    MODELS
 ═══════════════════════════════ */
 const UserSchema = new mongoose.Schema({
-  userId:     { type: String, unique: true, sparse: true },
-  username:   { type: String, required: true },
-  email:      { type: String, unique: true, required: true },
-  phone:      { type: String, default: "" },
-  gender:     {
+  userId:   { type: String, unique: true, sparse: true },
+  username: { type: String, required: true },
+  email:    { type: String, unique: true, required: true },
+  phone:    { type: String, default: "" },
+  gender:   {
     type: String,
     enum: ["male", "female", "other", "prefer_not", ""],
     default: "",
   },
-  password:   { type: String, required: true },
+  password: { type: String, required: true },
+
+  /* ★ NEW — role: "donor" (default) or "recipient" */
+  role: {
+    type:    String,
+    enum:    ["donor", "recipient"],
+    default: "donor",
+  },
+
+  /* ★ NEW — location captured at signup */
+  location: { type: String, default: "" },
+
   resetToken: { type: String, default: null },
 }, { timestamps: true });
 
@@ -185,6 +196,7 @@ if (process.env.CLOUDINARY_CLOUD_NAME) {
 
 /* ═══════════════════════════════
    JWT MIDDLEWARE
+   ★ req.role now available on every protected route
 ═══════════════════════════════ */
 const verifyToken = (req, res, next) => {
   const header = req.headers.authorization;
@@ -194,8 +206,16 @@ const verifyToken = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(401).json({ error: "Invalid token" });
     req.userId = decoded.userId;
+    req.role   = decoded.role || "donor"; // ★
     next();
   });
+};
+
+/* ★ Middleware — blocks recipients from donor-only routes */
+const guardDonor = (req, res, next) => {
+  if (req.role === "recipient")
+    return res.status(403).json({ error: "This feature is only available for donors." });
+  next();
 };
 
 /* ═══════════════════════════════
@@ -237,17 +257,22 @@ app.get("/", (req, res) => res.send("🚀 FeedForward API Running"));
 
 app.get("/api/ping", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+/* ★ refresh-token — includes role + username in new token */
 app.get("/api/refresh-token", verifyToken, async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select("_id email username");
+    const user = await User.findById(req.userId).select("_id email username role");
     if (!user) return res.status(404).json({ error: "User not found" });
-    const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "7d" });
-    res.json({ token });
+    const token = jwt.sign(
+      { userId: user._id, username: user.username, role: user.role || "donor" },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    res.json({ token, role: user.role || "donor" });
   } catch { res.status(500).json({ error: "Could not refresh token" }); }
 });
 
 /* ═══════════════════════════════
-   MIGRATION ROUTE
+   MIGRATION ROUTES
 ═══════════════════════════════ */
 app.get("/api/admin/backfill-userids", async (req, res) => {
   try {
@@ -277,12 +302,31 @@ app.get("/api/admin/backfill-userids", async (req, res) => {
   }
 });
 
+/* ★ NEW — set role="donor" for all existing users who have no role */
+app.get("/api/admin/backfill-roles", async (req, res) => {
+  try {
+    const result = await User.updateMany(
+      { $or: [{ role: { $exists: false } }, { role: null }, { role: "" }] },
+      { $set: { role: "donor" } }
+    );
+    res.json({
+      message: `✅ Backfilled role=donor for ${result.modifiedCount} users`,
+      updated: result.modifiedCount,
+    });
+  } catch (err) {
+    console.error("Role backfill error:", err);
+    res.status(500).json({ error: "Role backfill failed", details: err.message });
+  }
+});
+
 /* ═══════════════════════════════
    AUTH ROUTES
 ═══════════════════════════════ */
+
+/* ★ REGISTER — now accepts role + location */
 const handleRegister = async (req, res) => {
   try {
-    const { username, email, password, phone, gender } = req.body;
+    const { username, email, password, phone, gender, role, location } = req.body;
 
     if (!username || !email || !password)
       return res.status(400).json({ error: "All fields required" });
@@ -291,16 +335,27 @@ const handleRegister = async (req, res) => {
     if (await User.findOne({ email }))
       return res.status(409).json({ error: "Email already registered" });
 
+    /* Validate role — only allow known values, default to "donor" */
+    const validRole = ["donor", "recipient"].includes(role) ? role : "donor";
+
     const hash    = await bcrypt.hash(password, 10);
     const newUser = new User({
-      username, email,
+      username,
+      email,
       password: hash,
-      phone:    phone  || "",
-      gender:   gender || "",
+      phone:    phone    || "",
+      gender:   gender   || "",
+      role:     validRole,       // ★
+      location: location || "",  // ★
     });
     await newUser.save();
 
-    res.status(201).json({ message: "Registered successfully", userId: newUser.userId });
+    console.log(`✅ Registered: ${email} as ${validRole}`);
+    res.status(201).json({
+      message: "Registered successfully",
+      userId:  newUser.userId,
+      role:    validRole, // ★ return so frontend can cache immediately
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Registration failed" });
@@ -309,6 +364,7 @@ const handleRegister = async (req, res) => {
 app.post("/register",     handleRegister);
 app.post("/api/register", handleRegister);
 
+/* ★ LOGIN — role + username now in JWT payload */
 const handleLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -319,13 +375,32 @@ const handleLogin = async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(400).json({ error: "Invalid credentials" });
 
+    /* Backfill userId for old accounts */
     if (!user.userId) {
       await assignUserId(user);
       console.log(`✅ Backfilled userId for existing user: ${user.email} → ${user.userId}`);
     }
 
-    const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "7d" });
-    res.json({ token });
+    /* ★ Backfill role for old accounts — default to "donor" */
+    if (!user.role) {
+      user.role = "donor";
+      await User.updateOne({ _id: user._id }, { $set: { role: "donor" } });
+      console.log(`✅ Backfilled role=donor for: ${user.email}`);
+    }
+
+    /* ★ role + username included in JWT — no extra API call needed */
+    const token = jwt.sign(
+      { userId: user._id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({
+      token,
+      role:     user.role,      // ★
+      username: user.username,  // ★
+      userId:   user.userId,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Login failed" });
@@ -376,6 +451,7 @@ app.post("/api/reset-password/:token", handleResetPassword);
 
 /* ═══════════════════════════════
    PROFILE ROUTES
+   ★ Returns role + location
 ═══════════════════════════════ */
 app.get("/api/profile", verifyToken, async (req, res) => {
   try {
@@ -387,17 +463,23 @@ app.get("/api/profile", verifyToken, async (req, res) => {
       console.log(`✅ Profile fetch: backfilled userId for ${user.email} → ${user.userId}`);
     }
 
+    /* ★ Backfill role for old accounts */
+    if (!user.role) {
+      await User.updateOne({ _id: user._id }, { $set: { role: "donor" } });
+    }
+
     const fresh = await User.findById(req.userId).select("-password -resetToken");
-    res.json(fresh);
+    res.json(fresh); // ★ includes role + location
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch profile" });
   }
 });
 
+/* ★ PUT /api/profile — accepts location now */
 app.put("/api/profile", verifyToken, async (req, res) => {
   try {
-    const { username, phone, gender } = req.body;
+    const { username, phone, gender, location } = req.body;
 
     if (!username || username.trim().length < 2)
       return res.status(400).json({ error: "Username must be at least 2 characters" });
@@ -410,8 +492,9 @@ app.put("/api/profile", verifyToken, async (req, res) => {
       req.userId,
       {
         username: username.trim(),
-        phone:    (phone  || "").trim(),
-        gender:   gender  || "",
+        phone:    (phone    || "").trim(),
+        gender:   gender    || "",
+        location: (location || "").trim(), // ★
       },
       { new: true, runValidators: true }
     ).select("-password -resetToken");
@@ -433,7 +516,7 @@ const handleGetFeed = async (req, res) => {
     const data = await WasteData.find({})
       .sort({ foodWasteDate: -1 })
       .limit(500)
-      .populate("user", "username userId phone email"); // email added for donor details
+      .populate("user", "username userId phone email");
 
     const normalized = data.map(item => {
       const obj = item.toObject();
@@ -469,9 +552,12 @@ const handleGetWaste = async (req, res) => {
 app.get("/waste",     verifyToken, handleGetWaste);
 app.get("/api/waste", verifyToken, handleGetWaste);
 
-// Create
+/* ★ CREATE WASTE — recipients cannot post donations */
 const handleCreateWaste = async (req, res) => {
   try {
+    if (req.role === "recipient")
+      return res.status(403).json({ error: "Recipients cannot post food donations. Please register as a donor." });
+
     const { foodItem, foodQuantity, foodReason, foodWasteDate, location } = req.body;
     if (!foodItem || !foodQuantity || !foodReason || !foodWasteDate || !location)
       return res.status(400).json({ error: "All fields are required" });
@@ -537,6 +623,7 @@ app.patch("/api/waste/approve/:id", verifyToken, handleApproveWaste);
 
 /* ═══════════════════════════════
    INVENTORY ROUTES
+   ★ guardDonor — recipients blocked from all inventory routes
 ═══════════════════════════════ */
 const handleCreateInventory = async (req, res) => {
   try {
@@ -556,8 +643,8 @@ const handleCreateInventory = async (req, res) => {
     res.status(500).json({ error: "Failed to add inventory item" });
   }
 };
-app.post("/inventory",     verifyToken, handleCreateInventory);
-app.post("/api/inventory", verifyToken, handleCreateInventory);
+app.post("/inventory",     verifyToken, guardDonor, handleCreateInventory);
+app.post("/api/inventory", verifyToken, guardDonor, handleCreateInventory);
 
 const handleGetInventory = async (req, res) => {
   try {
@@ -566,8 +653,8 @@ const handleGetInventory = async (req, res) => {
     res.status(500).json({ error: "Failed to fetch inventory" });
   }
 };
-app.get("/inventory",     verifyToken, handleGetInventory);
-app.get("/api/inventory", verifyToken, handleGetInventory);
+app.get("/inventory",     verifyToken, guardDonor, handleGetInventory);
+app.get("/api/inventory", verifyToken, guardDonor, handleGetInventory);
 
 const handleUpdateInventory = async (req, res) => {
   try {
@@ -580,8 +667,8 @@ const handleUpdateInventory = async (req, res) => {
     res.status(500).json({ error: "Failed to update inventory item" });
   }
 };
-app.patch("/inventory/:id",     verifyToken, handleUpdateInventory);
-app.patch("/api/inventory/:id", verifyToken, handleUpdateInventory);
+app.patch("/inventory/:id",     verifyToken, guardDonor, handleUpdateInventory);
+app.patch("/api/inventory/:id", verifyToken, guardDonor, handleUpdateInventory);
 
 const handleDeleteInventory = async (req, res) => {
   try {
@@ -592,8 +679,8 @@ const handleDeleteInventory = async (req, res) => {
     res.status(500).json({ error: "Failed to delete inventory item" });
   }
 };
-app.delete("/inventory/:id",     verifyToken, handleDeleteInventory);
-app.delete("/api/inventory/:id", verifyToken, handleDeleteInventory);
+app.delete("/inventory/:id",     verifyToken, guardDonor, handleDeleteInventory);
+app.delete("/api/inventory/:id", verifyToken, guardDonor, handleDeleteInventory);
 
 const handleApproveInventory = async (req, res) => {
   try {
@@ -607,37 +694,31 @@ const handleApproveInventory = async (req, res) => {
     res.status(500).json({ error: "Failed to approve inventory item" });
   }
 };
-app.patch("/inventory/approve/:id",     verifyToken, handleApproveInventory);
-app.patch("/api/inventory/approve/:id", verifyToken, handleApproveInventory);
+app.patch("/inventory/approve/:id",     verifyToken, guardDonor, handleApproveInventory);
+app.patch("/api/inventory/approve/:id", verifyToken, guardDonor, handleApproveInventory);
 
 /* ═══════════════════════════════
    RESERVATION MODEL
    ─────────────────────────────
    collected   = true when donor physically hands food over
    pickedUpAt  = timestamp of that moment
-   ─────────────────────────────
-   Routes:
-     POST /api/reservations              → reserver makes a reservation
-     GET  /api/reservations/food/:id     → spot counts (reserved + pickedUp)
-     POST /api/reservations/verify-pickup→ donor verifies collector's code ★ NEW
-     POST /api/reservations/collect      → legacy alias for verify-pickup
-     GET  /api/reservations/my           → current user's own reservations
+   reserverId  = ★ NEW links to the User who reserved
 ═══════════════════════════════ */
 const ReservationSchema = new mongoose.Schema({
   foodItem:      { type: mongoose.Schema.Types.ObjectId, ref: "WasteData", required: true },
   reserverName:  { type: String, required: true },
   reserverPhone: { type: String, required: true },
   reserverEmail: { type: String, required: true },
+  reserverId:    { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }, // ★ NEW
   quantity:      { type: Number, default: 1, min: 1, max: 1 },
   code:          { type: String, required: true, unique: true },
   codeExpiresAt: { type: Date, required: true },
-  collected:     { type: Boolean, default: false },   // true = food physically handed over
-  pickedUpAt:    { type: Date, default: null },        // timestamp of handover
+  collected:     { type: Boolean, default: false },
+  pickedUpAt:    { type: Date, default: null },
 }, { timestamps: true });
 
 const Reservation = mongoose.model("Reservation", ReservationSchema);
 
-/* ── generate 6-char alphanumeric pickup code ── */
 const generateCode = () => {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
@@ -649,11 +730,7 @@ const generateCode = () => {
    RESERVATION ROUTES
 ═══════════════════════════════ */
 
-// ─────────────────────────────────────────────────────────────
-// POST /api/reservations
-// Collector reserves a food item. Returns full donor details
-// so the success screen in Display.jsx can show them immediately.
-// ─────────────────────────────────────────────────────────────
+// POST /api/reservations — ★ saves reserverId
 const handleCreateReservation = async (req, res) => {
   try {
     const { foodItemId, reserverName, reserverPhone, reserverEmail } = req.body;
@@ -667,7 +744,6 @@ const handleCreateReservation = async (req, res) => {
     if (!/^\+?[\d\s\-]{7,15}$/.test(reserverPhone))
       return res.status(400).json({ error: "Invalid phone number." });
 
-    // Populate user so we can return donor details to the frontend
     const food = await WasteData.findById(foodItemId)
       .populate("user", "username userId phone email");
     if (!food)
@@ -693,7 +769,7 @@ const handleCreateReservation = async (req, res) => {
 
     let code, codeExists;
     do {
-      code      = generateCode();
+      code       = generateCode();
       codeExists = await Reservation.findOne({ code });
     } while (codeExists);
 
@@ -704,6 +780,7 @@ const handleCreateReservation = async (req, res) => {
       reserverName:  reserverName.trim(),
       reserverPhone: reserverPhone.trim(),
       reserverEmail: reserverEmail.trim().toLowerCase(),
+      reserverId:    req.userId || null, // ★
       quantity:      1,
       code,
       codeExpiresAt,
@@ -718,20 +795,17 @@ const handleCreateReservation = async (req, res) => {
       console.log(`✅ Auto sold-out: ${food.foodItem} (${newCount}/${totalQty} reserved)`);
     }
 
-    // Return all donor + food details for the success screen
     res.status(201).json({
       message:       "Reservation confirmed!",
       code,
       codeExpiresAt,
       reservationId: reservation._id,
-      // Food details
       foodItem:      food.foodItem,
       foodQuantity:  food.foodQuantity,
       foodReason:    food.foodReason,
       foodWasteDate: food.foodWasteDate,
       location:      food.location,
       spotsLeft:     Math.max(0, totalQty - newCount),
-      // Donor contact details — shown on success screen
       donor: {
         name:   food.user?.username || "Anonymous",
         phone:  food.user?.phone    || null,
@@ -747,18 +821,7 @@ const handleCreateReservation = async (req, res) => {
 app.post("/reservations",     handleCreateReservation);
 app.post("/api/reservations", handleCreateReservation);
 
-// ─────────────────────────────────────────────────────────────
 // GET /api/reservations/food/:foodItemId
-// Returns spot counts for a food item.
-// Used by Waste.jsx table pickup progress bar.
-//
-// Returns:
-//   reserved  = total reservations made
-//   pickedUp  = reservations where collected = true (physically handed over)
-//   total     = food.foodQuantity (max spots)
-//   spotsLeft = total - reserved
-//   isSoldOut = food.approved || spotsLeft === 0
-// ─────────────────────────────────────────────────────────────
 const handleGetReservationCount = async (req, res) => {
   try {
     const food = await WasteData.findById(req.params.foodItemId);
@@ -766,14 +829,8 @@ const handleGetReservationCount = async (req, res) => {
 
     const totalQty = Number(food.foodQuantity) || 1;
 
-    const reserved = await Reservation.countDocuments({
-      foodItem: req.params.foodItemId,
-    });
-
-    const pickedUp = await Reservation.countDocuments({
-      foodItem:  req.params.foodItemId,
-      collected: true,
-    });
+    const reserved = await Reservation.countDocuments({ foodItem: req.params.foodItemId });
+    const pickedUp = await Reservation.countDocuments({ foodItem: req.params.foodItemId, collected: true });
 
     const spotsLeft = Math.max(0, totalQty - reserved);
     const isSoldOut = food.approved || spotsLeft === 0;
@@ -822,7 +879,6 @@ const handleVerifyPickup = async (req, res) => {
     if (!reservation)
       return res.status(404).json({ error: "Invalid or expired code." });
 
-    // Optional: verify the code belongs to the specific food item
     if (foodItemId) {
       const resItemId = (reservation.foodItem?._id || reservation.foodItem).toString();
       if (resItemId !== foodItemId.toString())
@@ -835,12 +891,10 @@ const handleVerifyPickup = async (req, res) => {
     if (new Date() > new Date(reservation.codeExpiresAt))
       return res.status(410).json({ error: "This pickup code has expired (24h limit)." });
 
-    // ── Mark as collected ──
     reservation.collected  = true;
     reservation.pickedUpAt = new Date();
     await reservation.save();
 
-    // ── Recount for this food item ──
     const food          = reservation.foodItem;
     const itemId        = food._id;
     const totalQty      = Number(food.foodQuantity) || 1;
@@ -849,7 +903,6 @@ const handleVerifyPickup = async (req, res) => {
     const spotsLeft     = Math.max(0, totalQty - totalReserved);
     const isSoldOut     = food.approved || spotsLeft === 0 || pickedUpCount >= totalQty;
 
-    // Auto sold-out when all spots are physically collected
     if (isSoldOut && !food.approved) {
       await WasteData.findByIdAndUpdate(itemId, { approved: true });
       console.log(`✅ Auto sold-out after pickup: "${food.foodItem}" (${pickedUpCount}/${totalQty} picked up)`);
@@ -931,10 +984,7 @@ const handleCollect = async (req, res) => {
 app.post("/reservations/collect",     verifyToken, handleCollect);
 app.post("/api/reservations/collect", verifyToken, handleCollect);
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/reservations/my
-// Current logged-in user's own reservations
-// ─────────────────────────────────────────────────────────────
+// GET /api/reservations/my — ★ now queries by reserverId too
 app.get("/api/reservations/my", verifyToken, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select("email phone");
@@ -942,6 +992,7 @@ app.get("/api/reservations/my", verifyToken, async (req, res) => {
 
     const reservations = await Reservation.find({
       $or: [
+        { reserverId:    req.userId },  // ★ primary
         { reserverEmail: user.email },
         ...(user.phone ? [{ reserverPhone: user.phone }] : []),
       ],
@@ -957,15 +1008,12 @@ app.get("/api/reservations/my", verifyToken, async (req, res) => {
 
 /* ═══════════════════════════════
    NOTIFICATION MODEL
-   Created when a collector requests a code resend.
-   The notification goes to the DONOR of that food item.
-   The donor sees it in their notification bell in the navbar.
 ═══════════════════════════════ */
 const NotificationSchema = new mongoose.Schema({
-  recipient: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true }, // donor user
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   title:     { type: String, required: true },
   message:   { type: String, required: true },
-  code:      { type: String, default: null },   // pickup code to show in bell
+  code:      { type: String, default: null },
   read:      { type: Boolean, default: false },
   type:      { type: String, default: "code_resend" },
 }, { timestamps: true });
@@ -975,8 +1023,6 @@ const Notification = mongoose.model("Notification", NotificationSchema);
 /* ═══════════════════════════════
    NOTIFICATION ROUTES
 ═══════════════════════════════ */
-
-// GET /api/notifications — get current donor's notifications (newest first)
 app.get("/api/notifications", verifyToken, async (req, res) => {
   try {
     const notifs = await Notification.find({ recipient: req.userId })
@@ -988,7 +1034,6 @@ app.get("/api/notifications", verifyToken, async (req, res) => {
   }
 });
 
-// PATCH /api/notifications/read-all — mark all as read for current user
 app.patch("/api/notifications/read-all", verifyToken, async (req, res) => {
   try {
     await Notification.updateMany({ recipient: req.userId, read: false }, { $set: { read: true } });
@@ -998,7 +1043,6 @@ app.patch("/api/notifications/read-all", verifyToken, async (req, res) => {
   }
 });
 
-// PATCH /api/notifications/:id/read — mark single notification as read
 app.patch("/api/notifications/:id/read", verifyToken, async (req, res) => {
   try {
     await Notification.findOneAndUpdate(
@@ -1033,11 +1077,10 @@ const handleResendCode = async (req, res) => {
 
     const name = reserverName.trim();
 
-    // Find the most recent active reservation for this person
     const reservation = await Reservation.findOne({
-      reserverName: { $regex: new RegExp(`^${name}$`, "i") }, // case-insensitive exact match
-      collected:    false,
-      codeExpiresAt: { $gt: new Date() }, // not expired
+      reserverName:  { $regex: new RegExp(`^${name}$`, "i") },
+      collected:     false,
+      codeExpiresAt: { $gt: new Date() },
     })
       .populate({
         path: "foodItem",
@@ -1056,10 +1099,9 @@ const handleResendCode = async (req, res) => {
     if (!donor)
       return res.status(404).json({ error: "Could not find the donor for this reservation." });
 
-    // Create a notification for the donor
     await Notification.create({
       recipient: donor._id,
-      title:     `📦 Code Resend Request`,
+      title:     "📦 Code Resend Request",
       message:   `${reservation.reserverName} forgot their pickup code for "${food?.foodItem || "your item"}". Their code is shown below — please tell them verbally.`,
       code:      reservation.code,
       type:      "code_resend",
@@ -1069,7 +1111,7 @@ const handleResendCode = async (req, res) => {
     console.log(`✅ Code resend: notification sent to donor ${donor.username} for collector ${name}`);
 
     res.json({
-      message: `✓ Done! ${donor.username || "The donor"} has been notified. Ask them to check their notification bell and read your code to you.`,
+      message:   `✓ Done! ${donor.username || "The donor"} has been notified. Ask them to check their notification bell and read your code to you.`,
       donorName: donor.username || "the donor",
     });
   } catch (err) {
@@ -1079,7 +1121,6 @@ const handleResendCode = async (req, res) => {
 };
 app.post("/reservations/resend-code",     verifyToken, handleResendCode);
 app.post("/api/reservations/resend-code", verifyToken, handleResendCode);
-
 
 /* ─────────────────────────────────────────────────────────────
    GET /api/reservations/search-by-user
@@ -1097,22 +1138,23 @@ app.get("/api/reservations/search-by-user", verifyToken, async (req, res) => {
 
     const query = q.trim();
 
-    // Find user by userId OR phone (case-insensitive)
-    const User = mongoose.model("User");
     const user = await User.findOne({
       $or: [
-        { userId:  { $regex: new RegExp(`^${query}$`, "i") } },
-        { phone:   query },
-        { phone:   { $regex: query } },
+        { userId: { $regex: new RegExp(`^${query}$`, "i") } },
+        { phone:  query },
+        { phone:  { $regex: query } },
       ],
     }).select("_id username userId phone email");
 
     if (!user)
       return res.status(404).json({ error: `No user found with User ID or phone "${query}". Please check and try again.` });
 
-    // Find their active reservations (not collected, not expired)
     const reservations = await Reservation.find({
-      reserverId:    user._id,
+      $or: [
+        { reserverId:    user._id },
+        { reserverEmail: user.email },
+        ...(user.phone ? [{ reserverPhone: user.phone }] : []),
+      ],
       collected:     false,
       codeExpiresAt: { $gt: new Date() },
     })
@@ -1121,9 +1163,8 @@ app.get("/api/reservations/search-by-user", verifyToken, async (req, res) => {
       .limit(10);
 
     if (!reservations.length)
-      return res.status(404).json({ error: `No active reservations found for this user. Codes may have expired or all pickups are complete.` });
+      return res.status(404).json({ error: "No active reservations found for this user. Codes may have expired or all pickups are complete." });
 
-    // Shape the response
     const shaped = reservations.map(r => ({
       _id:           r._id,
       reserverName:  r.reserverName,
@@ -1141,7 +1182,6 @@ app.get("/api/reservations/search-by-user", verifyToken, async (req, res) => {
       phone:        user.phone,
       reservations: shaped,
     });
-
   } catch (err) {
     console.error("search-by-user error:", err);
     res.status(500).json({ error: "Server error. Please try again." });
@@ -1161,7 +1201,6 @@ app.post("/api/reservations/resend-code-by-id", verifyToken, async (req, res) =>
     if (!reservationId)
       return res.status(400).json({ error: "reservationId is required." });
 
-    // Find reservation
     const reservation = await Reservation.findById(reservationId)
       .populate({
         path: "foodItem",
@@ -1183,7 +1222,6 @@ app.post("/api/reservations/resend-code-by-id", verifyToken, async (req, res) =>
     if (!donor)
       return res.status(404).json({ error: "Could not find the donor for this reservation." });
 
-    // Create notification for donor
     await Notification.create({
       recipient: donor._id,
       title:     "📦 Code Resend Request",
@@ -1196,11 +1234,10 @@ app.post("/api/reservations/resend-code-by-id", verifyToken, async (req, res) =>
     console.log(`✅ resend-code-by-id: notification sent to donor ${donor.username} for reservation ${reservationId}`);
 
     res.json({
-      message: `✓ Notification sent to ${donor.username || "the donor"}! They will see the code in their notification bell.`,
+      message:   `✓ Notification sent to ${donor.username || "the donor"}! They will see the code in their notification bell.`,
       donorName: donor.username,
       foodItem:  food?.foodItem,
     });
-
   } catch (err) {
     console.error("resend-code-by-id error:", err);
     res.status(500).json({ error: "Server error. Please try again." });
