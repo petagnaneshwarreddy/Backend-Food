@@ -506,6 +506,22 @@ app.put("/api/profile", verifyToken, async (req, res) => {
     res.status(500).json({ error: "Failed to update profile" });
   }
 });
+/* ═══════════════════════════════
+   RECIPIENTS — donor-only route
+   Returns all users with role="recipient"
+═══════════════════════════════ */
+app.get("/api/users/recipients", verifyToken, guardDonor, async (req, res) => {
+  try {
+    const recipients = await User.find({ role: "recipient" })
+      .select("username email phone gender location userId createdAt")
+      .sort({ username: 1 });
+
+    res.json(recipients);
+  } catch (err) {
+    console.error("Recipients fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch recipients." });
+  }
+});
 
 /* ═══════════════════════════════
    WASTE — COMMUNITY FEED
